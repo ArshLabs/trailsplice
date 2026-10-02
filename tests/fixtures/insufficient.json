@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "source": "constructed-case",
+  "provenance": "constructed",
+  "transaction_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+  "observations": [
+    { "kind": "receipt_absent" },
+    { "kind": "wait_timed_out" }
+  ]
+}

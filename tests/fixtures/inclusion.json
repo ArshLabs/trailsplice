@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "source": "constructed-case",
+  "provenance": "constructed",
+  "transaction_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+  "observations": [
+    {
+      "kind": "receipt",
+      "receipt": {
+        "transactionHash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+        "blockHash": "0x2222222222222222222222222222222222222222222222222222222222222222",
+        "blockNumber": "0x2a",
+        "status": "0x1"
+      }
+    }
+  ]
+}
