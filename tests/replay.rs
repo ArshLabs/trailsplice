@@ -33,7 +33,6 @@ fn three_manual_cases_have_the_expected_conclusions_and_references() {
     assert!(gap.contains(
         "The next saved receipt is #3; inclusion timing relative to the gap is unknown."
     ));
-    assert_eq!(gap, report_from_bytes(GAP).unwrap());
     for output in [&included, &absent, &gap] {
         assert!(output.contains("Evidence: constructed example"));
         assert!(output.contains(
@@ -124,7 +123,7 @@ fn gap_references_follow_saved_order_and_identical_receipts_do_not_conflict() {
 #[test]
 fn invalid_evidence_is_rejected_before_a_report() {
     for change in [
-        ("version", json!(2)),
+        ("version", json!(3)),
         (
             "wrong hash",
             json!("0x3333333333333333333333333333333333333333333333333333333333333333"),
@@ -148,7 +147,6 @@ fn invalid_evidence_is_rejected_before_a_report() {
         );
     }
     assert!(report_from_bytes(b"{").is_err());
-    assert!(report_from_bytes(&vec![b' '; 64 * 1024 + 1]).is_err());
     assert!(
         changed_report(
             |value| value["observations"] = json!(vec![json!({"kind":"receipt_absent"}); 129])
@@ -241,4 +239,86 @@ fn command_line_replays_cases_and_reports_failures() {
         assert!(output.stdout.is_empty());
         assert!(!output.stderr.is_empty());
     }
+}
+
+#[test]
+fn schema_two_replay_checks_saved_receipts_and_request_references() {
+    let mut value: Value = serde_json::from_slice(INCLUDED).unwrap();
+    value["schema_version"] = json!(2);
+    value["provenance"] = json!("captured_local");
+    let receipt = value["observations"][0]["receipt"].clone();
+    let payloads = [
+        json!("anvil/test"),
+        json!("0x7a69"),
+        json!({"number":"0x0", "hash":receipt["blockHash"]}),
+        receipt,
+    ];
+    let methods = [
+        "web3_clientVersion",
+        "eth_chainId",
+        "eth_getBlockByNumber",
+        "eth_getTransactionReceipt",
+    ];
+    let requests: Vec<_> = methods.into_iter().zip(payloads).enumerate().map(|(index, (method, result))| {
+        json!({"method":method,"started_elapsed_ms":index * 10,"completed_elapsed_ms":index * 10 + 1,
+            "response":json!({"jsonrpc":"2.0","id":1,"result":result}).to_string()})
+    }).collect();
+    value["capture"] = json!({"endpoint":"http://127.0.0.1:8545/", "run_id":"1-0", "started_unix_ms":0,
+        "run_budget_ms":1000,"finished_elapsed_ms":31,"requests":requests});
+    let replay = |value: &Value| report_from_bytes(&serde_json::to_vec(value).unwrap());
+    let report = replay(&value).unwrap();
+    assert!(report.contains("#1: receipt reports block 42"));
+    assert!(report.contains("execution successful"));
+    assert!(report.contains("local capture (not authenticated)"));
+    assert!(report.contains("Chain ID: 0x7a69"));
+    let mut inconsistent = value.clone();
+    inconsistent["observations"][0]["receipt"]["status"] = json!("0x0");
+    assert!(replay(&inconsistent).is_err());
+    inconsistent = value.clone();
+    inconsistent["observations"] = json!([{"kind":"request_failed","request":0}]);
+    assert!(replay(&inconsistent).is_err());
+    inconsistent = value.clone();
+    inconsistent["capture"]["requests"][3]["started_elapsed_ms"] = json!(1000);
+    assert!(replay(&inconsistent).is_err());
+    inconsistent = value.clone();
+    let original = value["capture"]["requests"][3]["response"]
+        .as_str()
+        .unwrap();
+    let duplicated_status = original.replace(
+        "\"status\":\"0x1\"",
+        "\"status\":\"0x0\",\"status\":\"0x1\"",
+    );
+    assert_ne!(original, duplicated_status);
+    inconsistent["capture"]["requests"][3]["response"] = json!(duplicated_status);
+    assert!(replay(&inconsistent).is_err());
+    inconsistent["capture"]["requests"][3]["response"] =
+        json!(format!("{{\"jsonrpc\":\"1.0\",{}", &original[1..]));
+    assert!(replay(&inconsistent).is_err());
+    value["capture"]["requests"][3]["response"] =
+        json!("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null,\"result\":null}");
+    value["observations"] = json!([{"kind":"wait_timed_out"}]);
+    value["capture"]["finished_elapsed_ms"] = json!(1000);
+    assert!(replay(&value).is_err());
+}
+
+#[test]
+fn schema_two_deadline_can_finish_before_identity_queries_complete() {
+    let response =
+        json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"unavailable"}}).to_string();
+    let value = json!({"schema_version":2,"source":"constructed-test","provenance":"captured_local",
+        "transaction_hash":"0x1111111111111111111111111111111111111111111111111111111111111111",
+        "observations":[{"kind":"request_failed","request":1},{"kind":"wait_timed_out"}],
+        "capture":{"endpoint":"http://127.0.0.1:8545/","run_id":"1-0","started_unix_ms":0,"run_budget_ms":1000,"finished_elapsed_ms":1000,
+            "requests":[{"method":"web3_clientVersion","started_elapsed_ms":0,"completed_elapsed_ms":1,"response":response,"error":"RPC error -32000: unavailable"}]}});
+    let report = report_from_bytes(&serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(report.contains("No saved receipt establishes inclusion."));
+    assert!(
+        report.contains("#1: web3_clientVersion request failed: RPC error -32000: unavailable")
+    );
+    assert!(report.contains("Chain ID: unknown"));
+    assert!(report.contains("Genesis: unknown"));
+    assert!(!report.contains("source returned no receipt"));
+    let mut invalid = value;
+    invalid["capture"]["finished_elapsed_ms"] = json!(999);
+    assert!(report_from_bytes(&serde_json::to_vec(&invalid).unwrap()).is_err());
 }

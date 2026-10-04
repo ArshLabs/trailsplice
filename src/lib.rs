@@ -1,10 +1,12 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{error::Error, fs::File, io::Read, path::Path};
+
+pub mod capture;
 
 const MAX_BYTES: usize = 64 * 1024;
 const MAX_OBSERVATIONS: usize = 128;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Evidence {
     schema_version: u32,
@@ -12,15 +14,20 @@ struct Evidence {
     provenance: String,
     transaction_hash: String,
     observations: Vec<Observation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capture: Option<capture::Capture>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Observation {
     Receipt {
         receipt: Receipt,
     },
     ReceiptAbsent,
+    RequestFailed {
+        request: usize,
+    },
     WaitTimedOut,
     #[serde(rename = "observation_gap")]
     Gap {
@@ -28,7 +35,7 @@ enum Observation {
     },
 }
 
-#[derive(Deserialize, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct Receipt {
     transaction_hash: String,
@@ -55,12 +62,15 @@ pub fn report_from_bytes(bytes: &[u8]) -> Result<String, Box<dyn Error>> {
 }
 
 fn validate(evidence: &Evidence) -> Result<(), String> {
-    if evidence.schema_version != 1 {
-        return Err("unsupported schema version; expected 1".into());
+    if !matches!(evidence.schema_version, 1 | 2) {
+        return Err("unsupported schema version; expected 1 or 2".into());
     }
-    if evidence.provenance != "constructed" {
-        return Err("this version accepts constructed examples only".into());
+    if (evidence.schema_version == 1 && evidence.provenance != "constructed")
+        || (evidence.schema_version == 2 && evidence.provenance != "captured_local")
+    {
+        return Err("provenance does not match the schema version".into());
     }
+    capture::validate(evidence)?;
     if evidence.source.is_empty()
         || evidence.source.len() > 64
         || !evidence
@@ -89,7 +99,9 @@ fn validate(evidence: &Evidence) -> Result<(), String> {
                     Ok(())
                 }
             }
-            Observation::ReceiptAbsent | Observation::WaitTimedOut => Ok(()),
+            Observation::ReceiptAbsent
+            | Observation::RequestFailed { .. }
+            | Observation::WaitTimedOut => Ok(()),
         };
         result.map_err(|error| format!("observation #{}: {error}", index + 1))?;
     }
@@ -138,8 +150,14 @@ fn validate_receipt(receipt: &Receipt, transaction_hash: &str) -> Result<(), Str
 
 fn report(evidence: &Evidence) -> String {
     let mut output = format!(
-        "Transaction: {}\nSource: {}\nEvidence: constructed example\n",
-        evidence.transaction_hash, evidence.source
+        "Transaction: {}\nSource: {}\nEvidence: {}\n",
+        evidence.transaction_hash,
+        evidence.source,
+        if evidence.schema_version == 1 {
+            "constructed example"
+        } else {
+            "local capture (not authenticated)"
+        }
     );
     let receipts: Vec<_> = evidence
         .observations
@@ -159,6 +177,9 @@ fn report(evidence: &Evidence) -> String {
     } else {
         output.push_str("No saved receipt establishes inclusion.\n");
     }
+    if let Some(capture) = &evidence.capture {
+        output.push_str(&capture.summary());
+    }
     for (index, observation) in evidence.observations.iter().enumerate() {
         let id = index + 1;
         match observation {
@@ -176,6 +197,14 @@ fn report(evidence: &Evidence) -> String {
             }
             Observation::ReceiptAbsent => {
                 output.push_str(&format!("#{id}: source returned no receipt.\n"));
+            }
+            Observation::RequestFailed { request } => {
+                let (method, error) = evidence
+                    .capture
+                    .as_ref()
+                    .expect("validated capture")
+                    .failure(*request);
+                output.push_str(&format!("#{id}: {method} request failed: {error}\n"));
             }
             Observation::WaitTimedOut => {
                 output.push_str(&format!("#{id}: observer's wait timed out.\n"));
